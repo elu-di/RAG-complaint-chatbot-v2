@@ -1,0 +1,30 @@
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# Large Datasets & Storage (Never commit large data files!)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+*.csv
+*.parquet
+*.zip
+*.tar.gz
+
+# Vector Databases
+vector_store/*
+!vector_store/.gitkeep
+chroma.sqlite3
+*.faiss
+*.index
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
