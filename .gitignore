@@ -28,3 +28,15 @@ chroma.sqlite3
 Thumbs.db
 .vscode/
 .idea/
+
+# Environment Variables & Secrets
+.env
+*.env
+
+# SQLite Databases
+*.db
+data/*.db
+
+# Generated Reports
+reports/*
+!reports/.gitkeep
