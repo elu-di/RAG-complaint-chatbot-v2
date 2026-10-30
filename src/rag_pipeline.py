@@ -2,19 +2,21 @@
 rag_pipeline.py -- Retrieval-Augmented Generation (RAG) Core Pipeline
 CrediTrust Financial AI Decision-Support System:
 1. Retriever   : Semantic search over ChromaDB vector store
-2. Filter      : Minimum similarity threshold (MIN_SIMILARITY=0.55)
+2. Filter      : Dynamic similarity threshold (default MIN_SIMILARITY=0.50)
                  + Minimum source count (MIN_SOURCES=2) before calling LLM
-3. Augmenter   : Prompt template with strict anti-hallucination guardrails
+3. Augmenter   : Prompt template with strict anti-hallucination & scope relevance guardrails
 4. Generator   : Groq Cloud API (openai/gpt-oss-20b)
 5. Evaluator   : Qualitative evaluation across representative business questions
 """
 
 import os
+import sys
 from dotenv import load_dotenv
 import chromadb
 from sentence_transformers import SentenceTransformer
 from groq import Groq
-import sys
+
+# Ensure UTF-8 console output on Windows
 sys.stdout.reconfigure(encoding="utf-8")
 
 # Explicitly locate the .env file in the project root
@@ -30,23 +32,25 @@ COLLECTION_NAME      = "creditrust_complaints"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 GROQ_MODEL           = "openai/gpt-oss-20b"
 
-# FIX 2A: Minimum cosine similarity — chunks below this score are noise.
-MIN_SIMILARITY = 0.63
+# Minimum cosine similarity baseline — balanced for natural human phrasings
+MIN_SIMILARITY = 0.50
 
-# FIX 2B: Minimum number of chunks that must pass the threshold before
+# Minimum number of chunks that must pass the threshold before
 # the LLM is called. If fewer than MIN_SOURCES chunks survive filtering,
-# we return the fallback message immediately (prevents hallucination from
-# 1 weakly-relevant chunk passing through).
+# we return the fallback message immediately.
 MIN_SOURCES = 2
 
-# Grounded System Prompt Template
+# Grounded System Prompt Template with Two-Layer Anti-Hallucination Guardrail
 PROMPT_TEMPLATE = """You are a senior financial intelligence analyst for CrediTrust Financial.
 Your mission is to analyze customer complaints and provide executive-level, actionable insights for Product Managers and Compliance teams.
 
 STRICT OPERATING RULES:
 1. Use ONLY the factual evidence provided in the Retrieved Complaint Excerpts below.
-2. If the excerpts do not contain sufficient evidence to answer the question, state:
-   "Based on the provided customer complaints, there is not enough information to answer this question."
+2. SCOPE RELEVANCE CHECK:
+   - Verify whether the retrieved excerpts directly address the specific financial product or primary issue requested by the user.
+   - If the user's question asks about a financial product or issue not directly covered in the excerpts (for example, home mortgages, vehicle loans, or student loans when the excerpts are personal loans or credit cards), or if the topic is only mentioned in passing as an incidental detail, you MUST refuse to answer and state ONLY:
+     "Based on the provided customer complaints, there is not enough information to answer this question."
+   - Do NOT attempt to answer questions about unrepresented products using passing mentions from other products.
 3. Do NOT invent, assume, or extrapolate facts not present in the context.
 4. Always cite specific Complaint IDs and Company names when highlighting customer pain points.
 5. Provide concise, bulleted, evidence-backed answers.
@@ -87,20 +91,20 @@ class ComplaintRAG:
         self.groq_client = Groq(api_key=api_key)
         print(f"RAG Pipeline initialized! (MIN_SIMILARITY={MIN_SIMILARITY}, MIN_SOURCES={MIN_SOURCES})\n")
 
-    def retrieve(self, query: str, top_k: int = 6, product_filter: str = None) -> list:
+    def retrieve(self, query: str, top_k: int = 6, product_filter: str = None, min_similarity: float = None) -> list:
         """
         Embed the query and retrieve top-k semantically relevant chunks.
-
-        FIX 2A applied here: chunks below MIN_SIMILARITY are discarded.
 
         Args:
             query:          Natural language question.
             top_k:          Candidates fetched from ChromaDB (default 6).
             product_filter: Optional ChromaDB metadata filter by product_category.
+            min_similarity: Optional threshold override (defaults to MIN_SIMILARITY).
 
         Returns:
-            List of dicts {text, metadata, similarity} — only chunks >= MIN_SIMILARITY.
+            List of dicts {text, metadata, similarity} — only chunks >= threshold.
         """
+        threshold = min_similarity if min_similarity is not None else MIN_SIMILARITY
         query_embedding = self.embed_model.encode([query], normalize_embeddings=True).tolist()
 
         where_clause = None
@@ -119,7 +123,7 @@ class ComplaintRAG:
         for i in range(len(results["documents"][0])):
             similarity = round(1.0 - results["distances"][0][i], 4)
 
-            if similarity < MIN_SIMILARITY:
+            if similarity < threshold:
                 filtered_out += 1
                 continue
 
@@ -130,27 +134,25 @@ class ComplaintRAG:
             })
 
         if filtered_out > 0:
-            print(f"  [Threshold Filter] Dropped {filtered_out} chunk(s) below {MIN_SIMILARITY} similarity.")
+            print(f"  [Threshold Filter] Dropped {filtered_out} chunk(s) below {threshold} similarity.")
 
         return retrieved_chunks
 
-    def generate_response(self, query: str, top_k: int = 6, product_filter: str = None) -> dict:
+    def generate_response(self, query: str, top_k: int = 6, product_filter: str = None, min_similarity: float = None) -> dict:
         """
         Full RAG pipeline: retrieve -> filter -> guard -> build prompt -> generate.
-
-        FIX 2B applied here: require at least MIN_SOURCES chunks before calling LLM.
         """
+        threshold = min_similarity if min_similarity is not None else MIN_SIMILARITY
+
         # 1. Retrieve with similarity filtering
-        sources = self.retrieve(query, top_k=top_k, product_filter=product_filter)
+        sources = self.retrieve(query, top_k=top_k, product_filter=product_filter, min_similarity=threshold)
 
         # 2. Guard: require minimum number of high-quality sources
-        #    This prevents the LLM from hallucinating when only 1 weakly-relevant
-        #    chunk slips through the similarity threshold.
         if len(sources) < MIN_SOURCES:
             print(f"  [Source Guard] Only {len(sources)} source(s) passed — need at least {MIN_SOURCES}. Returning fallback.")
             return {
                 "answer": "Based on the provided customer complaints, there is not enough information to answer this question.",
-                "sources": sources,  # Return what we found (even if insufficient) for transparency
+                "sources": sources,
             }
 
         # 3. Build structured context block for the prompt
@@ -197,19 +199,15 @@ def run_qualitative_evaluation():
         ("Why are customers unhappy with Credit Card billing disputes and unauthorized fees?",
          "Credit Card"),
 
-        # 2. Money Transfers
-        # REPHRASED (FIX): Using complaint-style vocabulary instead of business jargon.
-        # Original: "What are the major pain points users face with money transfer delays and account debits?"
-        # Problem : "pain points" and "account debits" don't appear in complaint text → low similarity.
-        # Fix     : Natural language that mirrors how real customers write complaints.
+        # 2. Money Transfers (complaint-style vocabulary)
         ("Customer complaints regarding money transfers not arriving, transfer delays, or unauthorized transactions",
- "Money Transfer"),
+         "Money Transfer"),
 
         # 3. Savings Accounts
         ("Why do customers report frozen savings accounts or inability to access their funds?",
          "Savings Account"),
 
-        # 4. Personal Loans (previously empty — Fixed by oversampling in Task 2)
+        # 4. Personal Loans
         ("What complaints do borrowers file regarding personal loan payment processing and unexpected interest?",
          "Personal Loan"),
 

@@ -32,3 +32,11 @@ Thumbs.db
 # Environment Variables & Secrets
 .env
 *.env
+
+# SQLite Databases
+*.db
+data/*.db
+
+# Generated Reports
+reports/*
+!reports/.gitkeep
